@@ -41,12 +41,18 @@ module private Patterns =
         if t.IsGenericType && t.GetGenericTypeDefinition() = typedefof<Func<_>> 
         then t.GetGenericArguments().[0] |> Some
         else None
+    let (|SeqType|_|) (t:Type) =
+        if t.IsGenericType && t.GetGenericTypeDefinition() = typedefof<IEnumerable<_>>
+        then t.GetGenericArguments().[0] |> Some
+        else None
+
+module private Choice =
+    let toOption = function Choice1Of2 x -> Some x | Choice2Of2 _ -> None
 
 /// IoC Container
 type Container () as container =
     let catalog = Dictionary<AbstractType, Constructor * Lifetime>()
     let singletons = Dictionary<ConcreteType,obj>()
-    let asOption = function Choice1Of2 x -> Some x | Choice2Of2 _ -> None
     let rec tryResolve cs t =
         match catalog.TryGetValue t with
         | true, (Reflected u , lifetime) -> 
@@ -72,7 +78,7 @@ type Container () as container =
             t.GetConstructors()
             |> Array.sortBy (fun c -> c.GetParameters().Length)
             |> Seq.map (tryConstructor cs)
-        match constructors |> Seq.tryPick asOption with
+        match constructors |> Seq.tryPick Choice.toOption with
         | Some value -> Choice1Of2 value
         | None -> constructorsError t constructors |> Choice2Of2
     and constructorsError t constructors =
@@ -81,7 +87,7 @@ type Container () as container =
     and tryConstructor cs ci =
         let ps = ci.GetParameters()
         let args = ps |> Array.map (fun p -> tryResolveArgument cs p.ParameterType)
-        let args' = args |> Array.choose asOption
+        let args' = args |> Array.choose Choice.toOption
         if args'.Length = ps.Length then args' |> ci.Invoke |> Choice1Of2
         else constructorError ci.DeclaringType ps args |> Choice2Of2
     and constructorError t ps args =
@@ -95,9 +101,21 @@ type Container () as container =
         | FuncType result ->
             let mi = typeof<Container>.GetMethod("Resolve",[||]).MakeGenericMethod(result)
             Delegate.CreateDelegate(t, container, mi) |> box |> Choice1Of2
+        | SeqType t ->
+            getDerivedTypes cs t |> box |> Choice1Of2
         | t when t.IsPrimitive -> Choice2Of2 "Primitive arguments not supported"
         | t when t = typeof<string> -> Choice2Of2 "String arguments not supported"
         | t -> tryResolve cs t
+    and getDerivedTypes cs t =
+        let interfaces = catalog.Keys |> Seq.filter (fun x -> x.GetInterfaces() |> Seq.exists ((=) t))
+        let subTypes = catalog.Keys |> Seq.filter (fun x -> x.IsSubclassOf t)
+        let values =
+            Seq.append interfaces subTypes 
+            |> Seq.choose (tryResolve cs >> Choice.toOption) 
+            |> Seq.toArray
+        let result = Array.CreateInstance(t, values.Length)
+        Array.Copy(values, result, values.Length)
+        result
     /// Register sequence of abstract types against specified concrete type
     member container.Register(abstractTypes:AbstractType seq, concreteType:ConcreteType) =
         for t in abstractTypes do catalog.Add(t, (Reflected concreteType, Lifetime.Singleton))
