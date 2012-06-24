@@ -1,14 +1,29 @@
 ﻿namespace MiniIoc
 
+// Note: MiniIoc defaults to a general .Net facing library
+// define FSHARP compilation symbol for an F# facing library
+
 open System
 open System.Collections.Generic
 open System.Reflection
 open Microsoft.FSharp.Reflection
 
+#if FSHARP
 type Message = string
-exception TypeResolutionException of Message * Type
+exception TypeResolutionException of Message
+#else
+type TypeResolutionException(message) = inherit Exception(message)
+#endif
 
+#if FSHARP
 type Lifetime = Singleton | Transient
+#else
+type Lifetime = Singleton = 0 | Transient = 1
+[<AutoOpen; CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
+module Lifetime =
+    let Singleton = Lifetime.Singleton
+    let Transient = Lifetime.Transient
+#endif
 
 type AbstractType = Type
 type ConcreteType = Type
@@ -17,13 +32,20 @@ type private Constructor =
     | Reflected of ConcreteType 
     | Factory of (unit -> obj)
 
+[<AutoOpen>]
+module private Patterns =
+    let (|FunType|_|) t =
+        if FSharpType.IsFunction t then FSharpType.GetFunctionElements t |> Some
+        else None
+    let (|FuncType|_|) (t:Type) =
+        if t.IsGenericType && t.GetGenericTypeDefinition() = typedefof<Func<_>> 
+        then t.GetGenericArguments().[0] |> Some
+        else None
+
 /// IoC Container
 type Container () as container =
     let catalog = Dictionary<AbstractType, Constructor * Lifetime>()
     let singletons = Dictionary<ConcreteType,obj>()
-    let (|FunType|_|) t =
-        if FSharpType.IsFunction t then FSharpType.GetFunctionElements t |> Some
-        else None
     let asOption = function Choice1Of2 x -> Some x | Choice2Of2 _ -> None
     let rec tryResolve cs t =
         match catalog.TryGetValue t with
@@ -40,7 +62,7 @@ type Container () as container =
             let result = f()
             result |> function Choice1Of2 value -> store t value lifetime | Choice2Of2 _ -> ()
             result
-    and store t value = function Singleton -> singletons.Add(t,value) | Transient -> ()
+    and store t value = function Lifetime.Singleton -> singletons.Add(t,value) | _ -> ()
     and tryReflect cs t =
         if cs |> List.exists ((=) t) 
         then Choice2Of2 "Cycle detected" 
@@ -70,15 +92,18 @@ type Container () as container =
         match t with
         | FunType(arg,result) when arg = typeof<unit> ->
             FSharpValue.MakeFunction(t,fun args -> container.Resolve(result)) |> Choice1Of2
+        | FuncType result ->
+            let mi = typeof<Container>.GetMethod("Resolve",[||]).MakeGenericMethod(result)
+            Delegate.CreateDelegate(t, container, mi) |> box |> Choice1Of2
         | t when t.IsPrimitive -> Choice2Of2 "Primitive arguments not supported"
         | t when t = typeof<string> -> Choice2Of2 "String arguments not supported"
         | t -> tryResolve cs t
     /// Register sequence of abstract types against specified concrete type
     member container.Register(abstractTypes:AbstractType seq, concreteType:ConcreteType) =
-        for t in abstractTypes do catalog.Add(t, (Reflected concreteType, Singleton))
+        for t in abstractTypes do catalog.Add(t, (Reflected concreteType, Lifetime.Singleton))
     /// Register abstract type against specified type instance
     member container.Register<'TAbstract>(instance:'TAbstract) =
-        catalog.Add(typeof<'TAbstract>, (Reflected typeof<'TAbstract>, Singleton))
+        catalog.Add(typeof<'TAbstract>, (Reflected typeof<'TAbstract>, Lifetime.Singleton))
         singletons.Add(typeof<'TAbstract>, instance)
     /// Register abstract type with fluent interface
     member container.Register<'TAbstract when 'TAbstract : not struct>() = 
@@ -93,9 +118,15 @@ type Container () as container =
             invalidArg "concreteType" "Concrete type must implement abstract type"
         catalog.Add(abstractType, (Reflected concreteType, lifetime))
     /// Register abstract type against specified factory with given lifetime
+#if FSHARP
     member container.Register<'TAbstract when 'TAbstract : not struct>
             (f:unit->'TAbstract, lifetime:Lifetime) = 
         catalog.Add(typeof<'TAbstract>, (Factory(f >> box), lifetime))
+#else
+    member container.Register<'TAbstract when 'TAbstract : not struct>
+            (f:Func<'TAbstract>, lifetime:Lifetime) = 
+        catalog.Add(typeof<'TAbstract>, (Factory(fun () -> f.Invoke() |> box), lifetime))
+#endif 
     /// Resolve instance of specified abstract type
     member container.Resolve<'TAbstract when 'TAbstract : not struct>() =
         container.Resolve(typeof<'TAbstract>) :?> 'TAbstract
@@ -103,7 +134,7 @@ type Container () as container =
     member container.Resolve(abstractType:AbstractType) =
         match tryResolve [] abstractType with
         | Choice1Of2 value -> value
-        | Choice2Of2 message -> TypeResolutionException(message,abstractType) |> raise
+        | Choice2Of2 message -> TypeResolutionException(message) |> raise
     /// Remove instance reference from container
     member container.Release(instance:obj) =
         singletons |> Seq.filter (fun pair -> pair.Value = instance) |> Seq.toList
